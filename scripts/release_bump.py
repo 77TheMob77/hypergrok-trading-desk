@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 import stat
+import tempfile
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -94,9 +95,76 @@ def read(root, rel):
         return handle.read()
 
 
-def write(root, rel, text):
-    with open(safe_path(root, rel), "w", encoding="utf-8", newline="") as handle:
-        handle.write(text)
+def stage_file(path, data, mode):
+    fd, temporary = tempfile.mkstemp(prefix=".release-bump-", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        return temporary
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def apply_pending(root, pending):
+    originals, staged, committed = {}, {}, []
+
+    def cleanup(paths):
+        for temporary in paths:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    def rollback():
+        restore = {}
+        try:
+            for rel in committed:
+                path = safe_path(root, rel)
+                data, mode = originals[rel]
+                restore[rel] = stage_file(path, data, mode)
+            for rel, temporary in restore.items():
+                os.replace(temporary, safe_path(root, rel))
+        except Exception as exc:
+            cleanup(restore.values())
+            raise OSError(
+                f"rollback failed; manual recovery required: {exc}"
+            ) from exc
+        cleanup(restore.values())
+
+    try:
+        for rel, text in pending.items():
+            path = safe_path(root, rel)
+            with open(path, "rb") as handle:
+                original = handle.read()
+            mode = stat.S_IMODE(os.stat(path, follow_symlinks=False).st_mode)
+            originals[rel] = (original, mode)
+            staged[rel] = stage_file(path, text.encode("utf-8"), mode)
+
+        for rel, temporary in staged.items():
+            os.replace(temporary, safe_path(root, rel))
+            committed.append(rel)
+
+        sys.stdout.flush()
+        code = subprocess.run(
+            ["bash", safe_path(root, "scripts/check.sh")], cwd=root
+        ).returncode
+    except Exception:
+        if committed:
+            rollback()
+        raise
+    finally:
+        cleanup(staged.values())
+
+    if code:
+        rollback()
+    return code
 
 
 def splice(match, group, value):
@@ -279,10 +347,7 @@ def main(argv):
     if args.dry_run:
         return 0
     preflight(root)
-    for rel, text in pending.items():
-        write(root, rel, text)
-    sys.stdout.flush()
-    return subprocess.run(["bash", safe_path(root, "scripts/check.sh")], cwd=root).returncode
+    return apply_pending(root, pending)
 
 
 if __name__ == "__main__":

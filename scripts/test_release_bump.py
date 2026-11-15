@@ -16,12 +16,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "scripts", "release_bump.py")
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
-from release_bump import TAG_RE, PIN_BEFORE, doc_files
+from release_bump import TAG_RE, PIN_BEFORE, doc_files, apply_pending
 from check_manifests import MANIFESTS, PINNED_SOURCE_MANIFESTS  # noqa: E402
 
 NEW = "9.9.9"
@@ -384,6 +385,40 @@ class ReleaseBumpTest(unittest.TestCase):
         code, output = bump(root, env=env)
         self.assertEqual(code, 3, output)
         self.assertIn(STUB_MARK, output)
+
+    def test_replace_failure_restores_committed_files(self):
+        root = self.safe_case()
+        before = tree_digest(root)
+        pending = {
+            "plugin.json": read(root, "plugin.json").decode() + "\\n",
+            "README.md": read(root, "README.md").decode() + "\\n",
+        }
+        real_replace = os.replace
+        calls = 0
+
+        def fail_second_replace(source, destination):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected replace failure")
+            return real_replace(source, destination)
+
+        with patch("release_bump.os.replace", side_effect=fail_second_replace):
+            with self.assertRaisesRegex(OSError, "injected replace failure"):
+                apply_pending(root, pending)
+        self.assertEqual(tree_digest(root), before)
+
+    def test_check_failure_restores_all_pending_files(self):
+        root = self.safe_case()
+        before = tree_digest(root)
+        pending = {
+            "plugin.json": read(root, "plugin.json").decode() + "\\n",
+            "README.md": read(root, "README.md").decode() + "\\n",
+        }
+        with patch.dict(os.environ, {"STUB_CHECK_RC": "3"}):
+            code = apply_pending(root, pending)
+        self.assertEqual(code, 3)
+        self.assertEqual(tree_digest(root), before)
 
     def test_invalid_version_exits_2(self):
         root = self.case()
