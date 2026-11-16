@@ -95,7 +95,8 @@ def read(root, rel):
         return handle.read()
 
 
-def stage_file(path, data, mode):
+def stage(path, data, mode):
+    """Write `data` to a synced temporary file beside `path` and return its name."""
     fd, temporary = tempfile.mkstemp(prefix=".release-bump-", dir=os.path.dirname(path))
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -104,67 +105,50 @@ def stage_file(path, data, mode):
             os.fsync(handle.fileno())
         os.chmod(temporary, mode)
         return temporary
-    except Exception:
+    except BaseException:
+        discard([temporary])
+        raise
+
+
+def discard(paths):
+    for temporary in paths:
         try:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
-        raise
 
 
-def apply_pending(root, pending):
-    originals, staged, committed = {}, {}, []
+def write_all(root, pending):
+    """Replace every pending file, or none of them.
 
-    def cleanup(paths):
-        for temporary in paths:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
-
-    def rollback():
-        restore = {}
-        try:
-            for rel in committed:
-                path = safe_path(root, rel)
-                data, mode = originals[rel]
-                restore[rel] = stage_file(path, data, mode)
-            for rel, temporary in restore.items():
-                os.replace(temporary, safe_path(root, rel))
-        except Exception as exc:
-            cleanup(restore.values())
-            raise OSError(
-                f"rollback failed; manual recovery required: {exc}"
-            ) from exc
-        cleanup(restore.values())
-
+    Each file is staged beside its target and swapped in with an atomic rename,
+    so an interrupted write never leaves a half-written manifest. If any stage
+    or rename fails, files already replaced get their original bytes and mode
+    back before the error propagates.
+    """
+    originals, staged, replaced = {}, {}, []
     try:
         for rel, text in pending.items():
             path = safe_path(root, rel)
             with open(path, "rb") as handle:
-                original = handle.read()
-            mode = stat.S_IMODE(os.stat(path, follow_symlinks=False).st_mode)
-            originals[rel] = (original, mode)
-            staged[rel] = stage_file(path, text.encode("utf-8"), mode)
-
+                originals[rel] = (handle.read(), stat.S_IMODE(os.lstat(path).st_mode))
+            staged[rel] = stage(path, text.encode("utf-8"), originals[rel][1])
         for rel, temporary in staged.items():
             os.replace(temporary, safe_path(root, rel))
-            committed.append(rel)
-
-        sys.stdout.flush()
-        code = subprocess.run(
-            ["bash", safe_path(root, "scripts/check.sh")], cwd=root
-        ).returncode
-    except Exception:
-        if committed:
-            rollback()
+            replaced.append(rel)
+    except BaseException:
+        restore = {}
+        try:
+            for rel in replaced:
+                restore[rel] = stage(safe_path(root, rel), *originals[rel])
+            for rel, temporary in restore.items():
+                os.replace(temporary, safe_path(root, rel))
+        except BaseException as exc:
+            discard(restore.values())
+            raise OSError(f"rollback failed after a partial write; restore {replaced} from git: {exc}") from exc
         raise
     finally:
-        cleanup(staged.values())
-
-    if code:
-        rollback()
-    return code
+        discard(staged.values())
 
 
 def splice(match, group, value):
@@ -347,7 +331,9 @@ def main(argv):
     if args.dry_run:
         return 0
     preflight(root)
-    return apply_pending(root, pending)
+    write_all(root, pending)
+    sys.stdout.flush()
+    return subprocess.run(["bash", safe_path(root, "scripts/check.sh")], cwd=root).returncode
 
 
 if __name__ == "__main__":
